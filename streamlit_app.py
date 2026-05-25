@@ -200,7 +200,16 @@ def bump_data_version(path: str | None = None) -> None:
         versions[resource] = versions.get(resource, 0) + 1
 
 
-def api_request(method: str, path: str, json: dict | None = None):
+def api_request(
+    method: str,
+    path: str,
+    json: dict | None = None,
+    *,
+    extra_headers: dict | None = None,
+):
+    """Thin wrapper around httpx. ``extra_headers`` lets callers (eg. the
+    bootstrap-secret login) attach one-off headers without polluting the
+    default auth flow."""
     try:
         if method.upper() == "GET":
             status_code, payload = cached_get(
@@ -219,11 +228,14 @@ def api_request(method: str, path: str, json: dict | None = None):
                 return None
             return payload
 
+        request_headers = api_headers()
+        if extra_headers:
+            request_headers.update(extra_headers)
         with httpx.Client(timeout=8) as client:
             response = client.request(
                 method,
                 f"{API_BASE_URL}{path}",
-                headers=api_headers(),
+                headers=request_headers,
                 json=clean_payload(json) if json else None,
             )
         if response.status_code >= 400:
@@ -327,34 +339,6 @@ def remember_login(result: dict) -> None:
     st.session_state.role = result["role"]
     st.session_state.full_name = result["full_name"]
     st.session_state.is_bootstrap_admin = result.get("is_bootstrap_admin", False)
-    st.query_params["token"] = result["access_token"]
-
-
-def restore_login_from_url() -> None:
-    if st.session_state.get("token"):
-        return
-    token = st.query_params.get("token")
-    if not token:
-        return
-
-    try:
-        with httpx.Client(timeout=8) as client:
-            response = client.get(
-                f"{API_BASE_URL}/auth/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-    except httpx.RequestError:
-        return
-
-    if response.status_code != 200:
-        st.query_params.clear()
-        return
-
-    user = response.json()
-    st.session_state.token = token
-    st.session_state.role = user["role"]
-    st.session_state.full_name = user["full_name"]
-    st.session_state.is_bootstrap_admin = False
 
 
 def is_admin() -> bool:
@@ -397,17 +381,34 @@ def render_reset_password_screen(reset_token: str) -> None:
 def _render_sign_in_form(needs_bootstrap: bool) -> None:
     with st.form("login_form", clear_on_submit=False):
         full_name = ""
+        setup_secret = ""
         if needs_bootstrap:
             full_name = st.text_input("Full name")
         email = st.text_input("Email")
         password = st.text_input("Password", type="password")
+        if needs_bootstrap:
+            setup_secret = st.text_input(
+                "Setup secret (only needed when bootstrapping over the public URL)",
+                type="password",
+                help=(
+                    "Leave blank if you're signing in from the server's own "
+                    "console (loopback). If your VPS is reachable only via "
+                    "its public domain, paste the BOOTSTRAP_SECRET value "
+                    "you set in .env so the first sign-in is authorised."
+                ),
+            )
         submitted = st.form_submit_button("Sign in", width="stretch", type="primary")
 
     if submitted:
         payload = {"email": email, "password": password}
         if needs_bootstrap:
             payload["full_name"] = full_name
-        result = api_request("POST", "/auth/login", payload)
+        extra_headers = {}
+        if needs_bootstrap and setup_secret:
+            extra_headers["X-Bootstrap-Secret"] = setup_secret
+        result = api_request(
+            "POST", "/auth/login", payload, extra_headers=extra_headers or None,
+        )
         if result:
             # Clear the failed-sign-in flag so the reset link disappears next render.
             st.session_state.pop("show_password_reset_link", None)
@@ -505,7 +506,15 @@ _CURRENCY_COLUMN_HINTS = {
     "invoice_total",
 }
 
-_INTEGER_COLUMN_HINTS = {"quantity", "quantity_on_hand", "year", "remaining_quantity"}
+_INTEGER_COLUMN_HINTS = {
+    "quantity",
+    "quantity_on_hand",
+    "year",
+    "remaining_quantity",
+    "on hand",
+    "used",
+    "remaining",
+}
 
 
 def _prettify_column(name: str) -> str:
@@ -526,7 +535,8 @@ def _column_config_for(rows: list[dict]) -> dict | None:
         if lower in _CURRENCY_COLUMN_HINTS or lower.endswith("_amount"):
             config[key] = st.column_config.NumberColumn(nice, format="KES %,.2f")
         elif lower in _INTEGER_COLUMN_HINTS:
-            config[key] = st.column_config.NumberColumn(nice, format="%,.2f")
+            # Whole-unit columns render without a decimal tail.
+            config[key] = st.column_config.NumberColumn(nice, format="%d")
         elif lower in {"created_at", "updated_at", "expires_at"}:
             config[key] = st.column_config.DatetimeColumn(nice, format="YYYY-MM-DD HH:mm")
         else:
@@ -1156,7 +1166,12 @@ def render_inventory() -> None:
         with st.form("receive_stock"):
             item = select_option(active_items, "Garage item", "stock_item_select")
             supplier = select_option(active_suppliers, "Supplier", "stock_supplier_select")
-            quantity = st.number_input("Quantity", min_value=0.01, step=1.0, key="stock_qty")
+            # Whole units only — stocks 1, 2, 3 oil filters, not 1.5.
+            quantity = st.number_input(
+                "Quantity",
+                min_value=1, value=1, step=1,
+                format="%d", key="stock_qty",
+            )
             unit_cost = st.number_input("Supplier unit cost", min_value=0.0, step=100.0, key="stock_unit_cost")
             sale_price = st.number_input("Default sale price", min_value=0.0, step=100.0, key="stock_sale_price")
             ref = st.text_input("Supplier invoice/reference")
@@ -1254,11 +1269,13 @@ def _render_correct_receipt_panel(receipts: list[dict], suppliers: list[dict]) -
     if not target:
         return
 
-    used = float(target.get("quantity") or 0) - float(target.get("remaining_quantity") or 0)
+    qty_value = int(float(target.get("quantity") or 0))
+    remaining_value = int(float(target.get("remaining_quantity") or 0))
+    used = qty_value - remaining_value
     cols = st.columns(4)
-    cols[0].metric("Quantity", f"{float(target.get('quantity') or 0):g}")
-    cols[1].metric("Used", f"{used:g}")
-    cols[2].metric("Remaining", f"{float(target.get('remaining_quantity') or 0):g}")
+    cols[0].metric("Quantity", f"{qty_value:,d}")
+    cols[1].metric("Used", f"{used:,d}")
+    cols[2].metric("Remaining", f"{remaining_value:,d}")
     cols[3].metric("Unit cost", f"KES {float(target.get('unit_cost') or 0):,.2f}")
 
     edit_tab, delete_tab, audit_tab = st.tabs(["Edit", "Delete", "Audit log"])
@@ -1283,11 +1300,12 @@ def _render_correct_receipt_panel(receipts: list[dict], suppliers: list[dict]) -
             )
             new_quantity = st.number_input(
                 "Quantity",
-                min_value=0.01,
-                value=float(target.get("quantity") or 0),
-                step=1.0,
+                min_value=max(1, used),
+                value=qty_value,
+                step=1,
+                format="%d",
                 help=(
-                    f"Cannot go below the {used:g} unit(s) already used on "
+                    f"Cannot go below the {used:,d} unit(s) already used on "
                     "job cards."
                 ),
             )
@@ -1432,13 +1450,22 @@ def display_line_items(lines: list[dict]) -> None:
         {
             "type": line.get("item"),
             "description": line.get("description"),
-            "quantity": line.get("quantity"),
-            "rate": line.get("rate"),
-            "amount": line.get("amount"),
+            "quantity": int(float(line.get("quantity") or 0)),
+            "rate": float(line.get("rate") or 0),
+            "amount": float(line.get("amount") or 0),
         }
         for line in lines
     ]
-    st.dataframe(rows, hide_index=True, width="stretch")
+    st.dataframe(
+        rows,
+        hide_index=True,
+        width="stretch",
+        column_config={
+            "quantity": st.column_config.NumberColumn("Quantity", format="%d"),
+            "rate": st.column_config.NumberColumn("Rate", format="KES %,.2f"),
+            "amount": st.column_config.NumberColumn("Amount", format="KES %,.2f"),
+        },
+    )
 
 
 def to_float(value) -> float:
@@ -1719,7 +1746,7 @@ def _render_job_card_edit_tab(detail: dict, job_card_id: int, key_prefix: str) -
             "Tax rate (%)",
             min_value=0.0,
             max_value=50.0,
-            value=float(invoice.get("tax_rate") or 0),
+            value=float(job_card.get("tax_rate") or invoice.get("tax_rate") or 0),
             step=0.5,
         )
 
@@ -1800,7 +1827,8 @@ def _render_job_card_edit_tab(detail: dict, job_card_id: int, key_prefix: str) -
                     {
                         "id": s.get("garage_item_id"),
                         "name": (
-                            f"{s.get('item_name')}  ·  on hand {s.get('quantity_on_hand', 0)}"
+                            f"{s.get('item_name')}  ·  on hand "
+                            f"{int(float(s.get('quantity_on_hand') or 0))}"
                         ),
                         **s,
                     }
@@ -1810,7 +1838,7 @@ def _render_job_card_edit_tab(detail: dict, job_card_id: int, key_prefix: str) -
                 key=f"{key_prefix}_stock_{job_card_id}",
             )
             quantity = st.number_input(
-                "Quantity", min_value=0.01, value=1.0, step=1.0, format="%.2f"
+                "Quantity", min_value=1, value=1, step=1, format="%d"
             )
             unit_price = st.number_input(
                 "Unit price (KES)",
@@ -1953,6 +1981,84 @@ def _render_job_card_status_tab(detail: dict, job_card_id: int, key_prefix: str)
                 st.success("Status updated.")
             st.session_state.active_job_card_id = job_card_id
             st.rerun()
+
+    invoice_type_now = (invoice or {}).get("invoice_type") or ""
+    invoice_number = (invoice or {}).get("invoice_number")
+    is_finalised = invoice_type_now.lower() == "final"
+
+    if job_card.get("status") not in JOB_CARD_LOCKED_STATUSES and not is_finalised:
+        st.divider()
+        st.markdown("##### Invoice")
+        if invoice_number:
+            st.caption(
+                f"Estimate **{invoice_number}** is live on this card. Every "
+                "edit to line items refreshes its totals — same number, "
+                "current state. Click **Finalise** when the customer is "
+                "ready to be billed."
+            )
+        else:
+            st.caption(
+                "Create the customer-facing estimate. The same invoice "
+                "number stays in use through every revision; finalising "
+                "locks it as the bill."
+            )
+        with st.form(f"{key_prefix}_issue_invoice_{job_card_id}"):
+            notes = st.text_area(
+                "Invoice notes",
+                value=(invoice or {}).get("notes")
+                or (detail.get("intake") or {}).get("invoice_notes")
+                or "",
+                key=f"{key_prefix}_issue_invoice_notes_{job_card_id}",
+            )
+            cols = st.columns(2)
+            refresh_btn = cols[0].form_submit_button(
+                "Refresh estimate" if invoice_number else "Create estimate",
+                width="stretch",
+                type="primary",
+            )
+            finalize_btn = cols[1].form_submit_button(
+                "Finalise invoice",
+                width="stretch",
+                disabled=not invoice_number,
+                help=(
+                    None
+                    if invoice_number
+                    else "Create the estimate first, then finalise it."
+                ),
+            )
+        if refresh_btn:
+            result = api_request(
+                "POST",
+                f"/job-cards/{job_card_id}/invoices",
+                {"notes": notes or None},
+            )
+            if result:
+                st.success(
+                    f"Estimate {result.get('invoice_number')} updated."
+                    if invoice_number
+                    else f"Estimate {result.get('invoice_number')} created."
+                )
+                st.session_state.active_job_card_id = job_card_id
+                st.rerun()
+        if finalize_btn and invoice and invoice.get("id"):
+            result = api_request(
+                "POST",
+                f"/invoices/{invoice['id']}/finalize",
+            )
+            if result:
+                st.success(
+                    f"Invoice {result.get('invoice_number')} finalised. "
+                    "The job card is now locked; record payment from the "
+                    "Invoices page."
+                )
+                st.session_state.active_job_card_id = job_card_id
+                st.rerun()
+    elif is_finalised:
+        st.divider()
+        st.info(
+            f"Invoice **{invoice_number}** has been finalised. "
+            "Record payments from the Invoices page."
+        )
 
     if invoice and invoice.get("id"):
         st.divider()
@@ -2310,7 +2416,11 @@ def render_job_cards() -> None:
         if st.session_state.get("job_item_price_signature") != price_signature:
             st.session_state.job_item_price = stock_selling_price(stock_item)
             st.session_state.job_item_price_signature = price_signature
-        item_qty = st.number_input("Quantity used", min_value=0.01, step=1.0, key="job_item_qty")
+        item_qty = st.number_input(
+            "Quantity used",
+            min_value=1, value=1, step=1,
+            format="%d", key="job_item_qty",
+        )
         item_price = st.number_input(
             "Selling price",
             min_value=0.0,
@@ -2374,7 +2484,12 @@ def render_job_cards() -> None:
                 key="job_dropoff_amount",
             )
 
-        invoice_type = st.selectbox("Invoice type", ["intermediate", "final"], key="job_invoice_type")
+        # A new card always starts with an intermediate (estimate) invoice.
+        # Finalise it from the Status & Sharing tab once the bill is ready.
+        st.caption(
+            "Saving a card creates an **intermediate estimate** invoice. "
+            "Finalise it later — same invoice number — to bill the customer."
+        )
         discount_amount = st.number_input("Discount", min_value=0.0, step=100.0, key="job_discount")
         include_tax = st.checkbox("Include tax", key="job_include_tax")
         tax_rate = 0.0
@@ -2441,7 +2556,9 @@ def render_job_cards() -> None:
                     for item in st.session_state.job_items
                 ],
                 "additional_costs": st.session_state.job_costs,
-                "invoice_type": invoice_type,
+                # invoice_type field is legacy; the backend always creates
+                # an intermediate on first save. Promote via /invoices/{id}/finalize.
+                "invoice_type": "intermediate",
                 "invoice_notes": invoice_notes,
                 "discount_amount": discount_amount,
                 "tax_rate": tax_rate,
@@ -2459,23 +2576,39 @@ def render_job_cards() -> None:
             render_invoice_actions(st.session_state.last_invoice_id, "last_invoice")
 
 
+def _invoice_type_badge(value: str | None) -> str:
+    """Visual tag distinguishing an estimate from a chargeable bill."""
+    label = (value or "").lower()
+    if label == "final":
+        return "🟢 Final · Bill"
+    if label == "intermediate":
+        return "🔵 Intermediate · Estimate"
+    return label or "—"
+
+
 def render_invoices() -> None:
     st.title("Invoices")
-    st.caption("Track payment status, record receipts, and share invoices.")
+    st.caption(
+        "Intermediate invoices are estimates shared with the customer for "
+        "approval. **Final** invoices are the chargeable bills — only "
+        "those are eligible for receivables."
+    )
     invoices = api_request("GET", "/invoices") or []
 
-    # Inject the status badge into the rendered list so the table is scannable
-    # without overwhelming the data display helper.
+    # Decorate the list with the type + status badges so the table reads at
+    # a glance. We map back to the originals when the user selects one.
     enriched = [
-        {**invoice, "payment_status": _status_badge(invoice.get("payment_status"))}
+        {
+            **invoice,
+            "invoice_type": _invoice_type_badge(invoice.get("invoice_type")),
+            "payment_status": _status_badge(invoice.get("payment_status")),
+        }
         for invoice in invoices
     ]
     filtered_enriched = display_records(
         enriched, "invoices",
         empty_message="No invoices have been raised yet. Open a job card to issue one.",
     )
-    # Map filtered list back to the original objects (display_records returns
-    # filtered enriched rows; we want the originals for selection).
     by_id = {inv["id"]: inv for inv in invoices}
     filtered = [by_id[row["id"]] for row in filtered_enriched if "id" in row]
 
@@ -2483,52 +2616,64 @@ def render_invoices() -> None:
     if not selected:
         return
 
+    is_final = (selected.get("invoice_type") or "").lower() == "final"
     total = float(selected.get("total_amount") or 0)
     paid = float(selected.get("amount_paid") or 0)
     balance = float(selected.get("balance_due") or 0)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total", f"KES {total:,.2f}")
-    c2.metric("Paid", f"KES {paid:,.2f}")
-    c3.metric(
-        "Balance",
-        f"KES {balance:,.2f}",
-        delta=("Fully paid" if balance <= 0 else f"-KES {balance:,.2f}"),
-        delta_color="off" if balance <= 0 else "inverse",
-    )
-    c4.metric("Status", _status_badge(selected.get("payment_status")))
+    c1.metric("Type", _invoice_type_badge(selected.get("invoice_type")))
+    c2.metric("Total", f"KES {total:,.2f}")
+    c3.metric("Paid", f"KES {paid:,.2f}" if is_final else "—")
+    if is_final:
+        c4.metric(
+            "Balance",
+            f"KES {balance:,.2f}",
+            delta=("Fully paid" if balance <= 0 else f"-KES {balance:,.2f}"),
+            delta_color="off" if balance <= 0 else "inverse",
+        )
+    else:
+        c4.metric("Status", "Estimate · no payment")
 
     st.divider()
-    st.markdown("#### Record a payment")
-    with st.form(f"invoice_payment_{selected['id']}"):
-        cols = st.columns([2, 1])
-        with cols[0]:
-            amount_paid = st.number_input(
-                "Total amount received (cumulative)",
-                min_value=0.0,
-                value=paid,
-                step=100.0,
-                key=f"invoice_amount_paid_{selected['id']}",
-                help=(
-                    "Enter the running total received against this invoice — "
-                    "the system derives the payment status from it."
-                ),
-            )
-        with cols[1]:
-            st.caption("Tip")
-            st.write(
-                "Status is derived from the amount paid versus the total — "
-                "you don't need to set it manually."
-            )
-        if st.form_submit_button("Record payment", width="stretch", type="primary"):
-            result = api_request(
-                "PATCH",
-                f"/invoices/{selected['id']}/payment",
-                {"amount_paid": amount_paid},
-            )
-            if result:
-                st.success("Payment recorded.")
-                st.rerun()
+    if is_final:
+        st.markdown("#### Record a payment")
+        with st.form(f"invoice_payment_{selected['id']}"):
+            cols = st.columns([2, 1])
+            with cols[0]:
+                amount_paid = st.number_input(
+                    "Total amount received (cumulative)",
+                    min_value=0.0,
+                    value=paid,
+                    step=100.0,
+                    key=f"invoice_amount_paid_{selected['id']}",
+                    help=(
+                        "Enter the running total received against this invoice — "
+                        "the system derives the payment status from it."
+                    ),
+                )
+            with cols[1]:
+                st.caption("Tip")
+                st.write(
+                    "Status is derived from the amount paid versus the total — "
+                    "you don't need to set it manually."
+                )
+            if st.form_submit_button("Record payment", width="stretch", type="primary"):
+                result = api_request(
+                    "PATCH",
+                    f"/invoices/{selected['id']}/payment",
+                    {"amount_paid": amount_paid},
+                )
+                if result:
+                    st.success("Payment recorded.")
+                    st.rerun()
+    else:
+        st.info(
+            "This is an **intermediate** estimate. To collect payment, open "
+            "the related job card and issue a **final invoice** — it'll "
+            "reflect any extra parts or labour added since the estimate "
+            "was shared."
+        )
 
     st.divider()
     st.markdown("#### Invoice lines")
@@ -2607,17 +2752,26 @@ def render_dashboard() -> None:
     pending_cards = [c for c in pending_cards if c.get("is_active", True)]
 
     # ---- Derived metrics ------------------------------------------------
+    # Only FINAL invoices count as receivables. Intermediate invoices are
+    # estimates we share for approval and never appear on the financial
+    # ledger — see ``update_invoice_payment`` server-side which blocks
+    # payment recording against intermediates.
+    final_invoices = [
+        invoice for invoice in invoices
+        if (invoice.get("invoice_type") or "").lower() == "final"
+        and invoice.get("is_active", True)
+    ]
     today = date.today()
     open_invoices = [
         invoice
-        for invoice in invoices
+        for invoice in final_invoices
         if invoice.get("payment_status") in ("not_paid", "partially_paid")
         and float(invoice.get("balance_due") or 0) > 0
     ]
     receivable_total = sum(float(inv.get("balance_due") or 0) for inv in open_invoices)
     paid_today = sum(
         float(inv.get("amount_paid") or 0)
-        for inv in invoices
+        for inv in final_invoices
         if _parse_iso_dt(inv.get("updated_at") or inv.get("created_at"))
         and (_parse_iso_dt(inv.get("updated_at") or inv.get("created_at")).date() == today)
     )
@@ -2795,18 +2949,24 @@ def render_dashboard() -> None:
 
     # ---- Money + analysis ----------------------------------------------
     st.markdown("#### Analysis")
-    total_invoiced = sum(float(invoice.get("total_amount") or 0) for invoice in invoices)
-    total_paid = sum(float(invoice.get("amount_paid") or 0) for invoice in invoices)
+    # Lifetime numbers exclude intermediate invoices — those are estimates,
+    # not money the garage is owed.
+    total_invoiced = sum(float(invoice.get("total_amount") or 0) for invoice in final_invoices)
+    total_paid = sum(float(invoice.get("amount_paid") or 0) for invoice in final_invoices)
     summary_cols = st.columns(3)
     summary_cols[0].metric("Lifetime invoiced", f"KES {total_invoiced:,.0f}")
     summary_cols[1].metric("Lifetime received", f"KES {total_paid:,.0f}")
     summary_cols[2].metric(
         "Outstanding", f"KES {max(0.0, total_invoiced - total_paid):,.0f}"
     )
+    st.caption(
+        "Lifetime figures and receivables count **final** invoices only. "
+        "Intermediates are estimates and don't appear on the books."
+    )
 
     status_cols = st.columns(2)
     invoice_status: dict[str, int] = {}
-    for invoice in invoices:
+    for invoice in final_invoices:
         bucket = invoice.get("payment_status") or "not_paid"
         invoice_status[bucket] = invoice_status.get(bucket, 0) + 1
     job_status_counts = dict(job_stats.get("by_status") or {})
@@ -2930,9 +3090,6 @@ def main_app() -> None:
         render_invoices()
     else:
         render_settings()
-
-
-restore_login_from_url()
 
 if "token" not in st.session_state:
     login_screen()

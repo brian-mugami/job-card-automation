@@ -315,7 +315,9 @@ class GarageItemRead(GarageItemBase, ApiModel):
 class InventoryReceiptBase(BaseModel):
     garage_item_id: int
     supplier_id: int
-    quantity: Decimal = Field(gt=0)
+    # Quantity is counted in whole units — the garage stocks 1, 2, 3 oil
+    # filters, not 1.5. Money fields (unit_cost / sale_price) stay Decimal.
+    quantity: int = Field(gt=0)
     unit_cost: Decimal = Field(ge=0)
     default_sale_price: Decimal | None = Field(default=None, ge=0)
     supplier_invoice_ref: str | None = None
@@ -328,9 +330,22 @@ class InventoryReceiptCreate(InventoryReceiptBase):
     pass
 
 
-class InventoryReceiptRead(InventoryReceiptBase, ApiModel):
+class InventoryReceiptRead(ApiModel):
+    """Read schema doesn't inherit Base — Base now constrains ``quantity`` to
+    ``int``, which would refuse any legacy rows that stored a fractional
+    value. Reads stay Decimal-tolerant; the UI rounds to whole units."""
+
     id: int
+    garage_item_id: int
+    supplier_id: int
+    quantity: Decimal
     remaining_quantity: Decimal
+    unit_cost: Decimal
+    default_sale_price: Decimal | None = None
+    supplier_invoice_ref: str | None = None
+    supplier_invoice_file_path: str | None = None
+    notes: str | None = None
+    is_active: bool = True
     created_at: datetime
     item_name: str | None = None
     supplier_name: str | None = None
@@ -340,7 +355,7 @@ class InventoryReceiptUpdate(BaseModel):
     """Admin-only edit. ``reason`` is mandatory and stored in the audit trail."""
 
     supplier_id: int | None = None
-    quantity: Decimal | None = Field(default=None, gt=0)
+    quantity: int | None = Field(default=None, gt=0)
     unit_cost: Decimal | None = Field(default=None, ge=0)
     default_sale_price: Decimal | None = Field(default=None, ge=0)
     supplier_invoice_ref: str | None = None
@@ -371,6 +386,8 @@ class StockMovementRead(ApiModel):
     inventory_receipt_id: int | None = None
     job_card_id: int | None = None
     movement_type: StockMovementType
+    # Read-side stays Decimal so legacy rows that may have been written with
+    # fractional quantities still serialise; the UI formats as whole units.
     quantity: Decimal
     unit_cost: Decimal | None = None
     notes: str | None = None
@@ -397,7 +414,8 @@ class JobCardWorkInput(BaseModel):
 
 class JobCardInventoryItemInput(BaseModel):
     garage_item_id: int
-    quantity: Decimal = Field(gt=0)
+    # Whole units only — see InventoryReceiptBase for the rationale.
+    quantity: int = Field(gt=0)
     unit_price: Decimal = Field(ge=0)
     notes: str | None = None
 
@@ -447,8 +465,11 @@ class JobCardRead(ApiModel):
     mileage: str | None = None
     subtotal: Decimal
     discount_amount: Decimal
+    tax_rate: Decimal = Decimal("0.00")
     total_amount: Decimal
     is_active: bool
+    created_at: datetime
+    updated_at: datetime
     customer_name: str | None = None
     customer_phone: str | None = None
     customer_email: str | None = None
@@ -484,6 +505,11 @@ class JobCardHeaderUpdate(BaseModel):
     tax_rate: Decimal | None = Field(default=None, ge=0)
 
 
+class JobCardInvoiceCreate(BaseModel):
+    invoice_type: InvoiceType = InvoiceType.intermediate
+    notes: str | None = None
+
+
 class InvoiceRead(ApiModel):
     id: int
     invoice_number: str
@@ -501,6 +527,21 @@ class InvoiceRead(ApiModel):
     is_sent_email: bool
     is_sent_whatsapp: bool
     is_active: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class InvoiceLineRead(ApiModel):
+    id: int | None = None
+    invoice_id: int | None = None
+    line_order: int | None = None
+    source: str
+    source_id: int | None = None
+    item: str
+    description: str
+    quantity: Decimal
+    rate: Decimal
+    amount: Decimal
 
 
 class InvoiceShareRead(BaseModel):

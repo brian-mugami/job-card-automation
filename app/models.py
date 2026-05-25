@@ -294,6 +294,7 @@ class JobCard(Base, TimestampMixin):
     invoice_notes: Mapped[str | None] = mapped_column(Text)
     subtotal: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     discount_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    tax_rate: Mapped[Decimal] = mapped_column(Numeric(5, 2), default=0)
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
@@ -381,3 +382,20 @@ class Invoice(Base, TimestampMixin):
             Decimal("0.00"),
             (self.total_amount or Decimal("0.00")) - (self.amount_paid or Decimal("0.00")),
         )
+
+
+class InvoiceLine(Base, TimestampMixin):
+    __tablename__ = "invoice_lines"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    invoice_id: Mapped[int] = mapped_column(ForeignKey("invoices.id"), index=True)
+    line_order: Mapped[int] = mapped_column(Integer, default=0)
+    source: Mapped[str] = mapped_column(String(40))
+    source_id: Mapped[int | None] = mapped_column(Integer)
+    item: Mapped[str] = mapped_column(String(80))
+    description: Mapped[str] = mapped_column(Text)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=1)
+    rate: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+    amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), default=0)
+
+    invoice: Mapped[Invoice] = relationship()

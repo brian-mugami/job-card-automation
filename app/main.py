@@ -70,11 +70,21 @@ async def lifespan(_: FastAPI):
     await engine.dispose()
 
 
-app = FastAPI(title="Job Card Automation System API", version="0.1.0", lifespan=lifespan)
+_settings = get_settings()
+# Hide OpenAPI / Swagger / ReDoc unless the operator explicitly opts in via
+# ``EXPOSE_API_DOCS=true``. The public deploy doesn't need a discoverable
+# schema, and the dev experience can always flip the flag locally.
+app = FastAPI(
+    title="Job Card Automation System API",
+    version="0.1.0",
+    lifespan=lifespan,
+    docs_url="/docs" if _settings.expose_api_docs else None,
+    redoc_url="/redoc" if _settings.expose_api_docs else None,
+    openapi_url="/openapi.json" if _settings.expose_api_docs else None,
+)
 
 # CORS — permissive for local dev; configure ``CORS_ALLOW_ORIGINS`` in ``.env``
 # with a comma-separated list of real origins before hosting.
-_settings = get_settings()
 _cors_origins = [o.strip() for o in _settings.cors_allow_origins.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -542,13 +552,27 @@ async def login(
     user: models.User | None = None
 
     if user_count == 0:
-        if _client_ip(request) not in _LOOPBACK_HOSTS:
+        # Bootstrap is allowed if EITHER the request comes from the loopback
+        # interface (local console) OR the operator has configured a one-time
+        # ``BOOTSTRAP_SECRET`` env var and the request supplies it via the
+        # ``X-Bootstrap-Secret`` header. The second path is what hosted
+        # deployments (Easypanel etc.) use — the proxy network never reports
+        # 127.0.0.1, so a header secret is the only way to do the first sign-in
+        # over the public domain without SSH-ing into a container.
+        is_loopback = _client_ip(request) in _LOOPBACK_HOSTS
+        configured_secret = (get_settings().bootstrap_secret or "").strip()
+        supplied_secret = (request.headers.get("X-Bootstrap-Secret") or "").strip()
+        secret_match = bool(configured_secret) and supplied_secret == configured_secret
+        if not (is_loopback or secret_match):
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail=(
-                    "The first administrator can only be created from the local machine "
-                    "(loopback interface). Open the app on the server's own console and "
-                    "try again, or create the first admin via a CLI tool."
+                    "The first administrator can only be created from the local "
+                    "machine, OR by supplying a matching X-Bootstrap-Secret "
+                    "header that matches the BOOTSTRAP_SECRET env var. Open "
+                    "the app on the server's own console, or set "
+                    "BOOTSTRAP_SECRET in .env and pass it as the setup secret "
+                    "on the first sign-in."
                 ),
             )
         full_name = payload.full_name or email_normalised.split("@", 1)[0]
@@ -1682,8 +1706,11 @@ async def job_card_summary_row(session: AsyncSession, job_card: models.JobCard) 
         "mileage": job_card.mileage,
         "subtotal": job_card.subtotal,
         "discount_amount": job_card.discount_amount,
+        "tax_rate": job_card.tax_rate,
         "total_amount": job_card.total_amount,
         "is_active": job_card.is_active,
+        "created_at": job_card.created_at,
+        "updated_at": job_card.updated_at,
         "customer_name": customer.full_name if customer else None,
         "customer_phone": customer.phone if customer else None,
         "customer_email": customer.email if customer else None,
@@ -1695,7 +1722,7 @@ async def job_card_summary_row(session: AsyncSession, job_card: models.JobCard) 
     }
 
 
-async def invoice_lines(
+async def live_invoice_lines(
     session: AsyncSession,
     job_card_id: int,
     invoice: models.Invoice | None = None,
@@ -1765,14 +1792,25 @@ async def invoice_lines(
                 "amount": cost.amount,
             }
         )
-    if invoice is None:
-        invoice = await latest_invoice_for_job(session, job_card_id)
-    if invoice and money(invoice.discount_amount) > 0:
+
+    subtotal = sum((money(row["amount"]) for row in rows), Decimal("0.00"))
+    if invoice:
         discount = money(invoice.discount_amount)
+        tax_rate = money(invoice.tax_rate)
+        tax = money(invoice.vat_amount)
+        tax_source_id = invoice.id
+    else:
+        job_card = await session.get(models.JobCard, job_card_id)
+        discount = money(job_card.discount_amount if job_card else 0)
+        tax_rate = money(job_card.tax_rate if job_card else 0)
+        tax = money(max(Decimal("0.00"), subtotal - discount) * tax_rate / Decimal("100"))
+        tax_source_id = None
+
+    if discount > 0:
         rows.append(
             {
                 "source": "discount",
-                "source_id": invoice.id,
+                "source_id": invoice.id if invoice else None,
                 "item": "Discount",
                 "description": "Discount",
                 "quantity": Decimal("1.00"),
@@ -1780,13 +1818,12 @@ async def invoice_lines(
                 "amount": -discount,
             }
         )
-    if invoice and money(invoice.vat_amount) > 0:
-        rate_label = f" ({money(invoice.tax_rate):g}%)" if money(invoice.tax_rate) > 0 else ""
-        tax = money(invoice.vat_amount)
+    if tax > 0:
+        rate_label = f" ({tax_rate:g}%)" if tax_rate > 0 else ""
         rows.append(
             {
                 "source": "tax",
-                "source_id": invoice.id,
+                "source_id": tax_source_id,
                 "item": "Tax",
                 "description": f"Tax{rate_label}",
                 "quantity": Decimal("1.00"),
@@ -1795,6 +1832,75 @@ async def invoice_lines(
             }
         )
     return rows
+
+
+async def stored_invoice_lines(session: AsyncSession, invoice_id: int) -> list[dict]:
+    lines = (
+        await session.scalars(
+            select(models.InvoiceLine)
+            .where(models.InvoiceLine.invoice_id == invoice_id)
+            .order_by(models.InvoiceLine.line_order.asc(), models.InvoiceLine.id.asc())
+        )
+    ).all()
+    return [
+        {
+            "id": line.id,
+            "invoice_id": line.invoice_id,
+            "line_order": line.line_order,
+            "source": line.source,
+            "source_id": line.source_id,
+            "item": line.item,
+            "description": line.description,
+            "quantity": line.quantity,
+            "rate": line.rate,
+            "amount": line.amount,
+        }
+        for line in lines
+    ]
+
+
+async def snapshot_invoice_lines(
+    session: AsyncSession,
+    invoice_id: int,
+    lines: Sequence[dict],
+) -> None:
+    materialized_lines = list(lines) or [
+        {
+            "source": "empty",
+            "source_id": invoice_id,
+            "item": "Invoice",
+            "description": "No charges",
+            "quantity": Decimal("1.00"),
+            "rate": Decimal("0.00"),
+            "amount": Decimal("0.00"),
+        }
+    ]
+    for index, line in enumerate(materialized_lines, start=1):
+        session.add(
+            models.InvoiceLine(
+                invoice_id=invoice_id,
+                line_order=index,
+                source=str(line.get("source") or "line"),
+                source_id=line.get("source_id"),
+                item=str(line.get("item") or "Line"),
+                description=str(line.get("description") or ""),
+                quantity=money(line.get("quantity") or 1),
+                rate=money(line.get("rate") or 0),
+                amount=money(line.get("amount") or 0),
+            )
+        )
+
+
+async def invoice_lines(
+    session: AsyncSession,
+    job_card_id: int,
+    invoice: models.Invoice | None = None,
+) -> list[dict]:
+    if invoice:
+        snapshot = await stored_invoice_lines(session, invoice.id)
+        if snapshot:
+            return snapshot
+    return await live_invoice_lines(session, job_card_id, invoice)
 
 
 async def invoice_context(session: AsyncSession, invoice_id: int) -> dict:
@@ -1852,10 +1958,12 @@ async def job_card_detail(session: AsyncSession, job_card_id: int) -> dict:
             "payment_status": invoice.payment_status,
             "amount_paid": invoice.amount_paid,
             "balance_due": invoice.balance_due,
+            "created_at": invoice.created_at,
+            "updated_at": invoice.updated_at,
         }
         if invoice
         else None,
-        "lines": await invoice_lines(session, job_card.id, invoice),
+        "lines": await live_invoice_lines(session, job_card.id),
         "intake": {
             "intake_mode": job_card.intake_mode,
             "delivery_mode": job_card.delivery_mode,
@@ -1936,7 +2044,7 @@ async def get_job_card_lines(
     job_card = await session.get(models.JobCard, job_card_id)
     if not job_card:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job card not found")
-    return await invoice_lines(session, job_card.id)
+    return await live_invoice_lines(session, job_card.id)
 
 
 @app.get("/job-cards/{job_card_id}")
@@ -1977,10 +2085,21 @@ async def update_job_card_status(
 
     invoice = await latest_invoice_for_job(session, job_card.id)
     if target_status == models.JobCardStatus.closed:
+        await recompute_job_card_totals(session, job_card.id)
         if not invoice:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Payment has to be complete before closing this job card.",
+            )
+        if invoice.invoice_type != models.InvoiceType.final:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Create a final invoice before closing this job card.",
+            )
+        if money(invoice.total_amount) != money(job_card.total_amount):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Create the latest invoice before closing this job card.",
             )
         if money(invoice.balance_due) > 0:
             raise HTTPException(
@@ -2045,16 +2164,49 @@ async def _ensure_job_card_editable(session: AsyncSession, job_card_id: int) -> 
                 "changing line items."
             ),
         )
+    # Block edits once the bill is final — the invoice is the contract.
+    finalised = await session.scalar(
+        select(models.Invoice.id)
+        .where(
+            models.Invoice.job_card_id == job_card_id,
+            models.Invoice.invoice_type == models.InvoiceType.final,
+            models.Invoice.is_active.is_(True),
+        )
+        .limit(1)
+    )
+    if finalised:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This job card's invoice has been finalised — line items are "
+                "locked. Open a new job card if more work is needed."
+            ),
+        )
     return job_card
 
 
-async def recompute_job_card_totals(session: AsyncSession, job_card_id: int) -> None:
-    """Rebuild ``job_card.subtotal`` / ``total_amount`` and the matching
-    invoice totals from the current set of active works, items, and costs.
+async def latest_active_invoice_for_job(
+    session: AsyncSession, job_card_id: int
+) -> models.Invoice | None:
+    """Return the single active invoice on this job card, if any."""
+    return await session.scalar(
+        select(models.Invoice)
+        .where(
+            models.Invoice.job_card_id == job_card_id,
+            models.Invoice.is_active.is_(True),
+        )
+        .order_by(models.Invoice.id.desc())
+        .limit(1)
+    )
 
-    Discount and tax rate are read off the invoice (where they live), so
-    edits to lines automatically flow through to the customer-facing numbers
-    without losing the admin-applied discount.
+
+async def recompute_job_card_totals(session: AsyncSession, job_card_id: int) -> None:
+    """Rebuild current job-card totals from the active work, item, and cost lines.
+
+    Also syncs the live **intermediate** invoice (if one exists) so the
+    customer-facing estimate stays in step with line-item edits. Once an
+    invoice has been finalized, its totals are locked — only the job card's
+    own ``subtotal`` / ``total_amount`` continue to track (historical interest).
     """
     works_total = await session.scalar(
         select(func.coalesce(func.sum(models.JobCardWork.labour_amount), 0)).where(
@@ -2081,23 +2233,144 @@ async def recompute_job_card_totals(session: AsyncSession, job_card_id: int) -> 
     subtotal = money(works_total) + money(items_total) + money(costs_total)
     job_card.subtotal = subtotal
 
-    invoice = await latest_invoice_for_job(session, job_card_id)
     discount = money(
-        job_card.discount_amount
-        if job_card.discount_amount is not None
-        else (invoice.discount_amount if invoice else 0)
+        job_card.discount_amount if job_card.discount_amount is not None else 0
     )
-    tax_rate = money(invoice.tax_rate if invoice else 0)
+    tax_rate = money(job_card.tax_rate)
     net = max(Decimal("0.00"), subtotal - discount)
     tax_amount = money(net * tax_rate / Decimal("100"))
-    job_card.total_amount = money(net + tax_amount)
+    total_amount = money(net + tax_amount)
+    job_card.total_amount = total_amount
 
-    if invoice:
-        invoice.subtotal = subtotal
-        invoice.discount_amount = discount
-        invoice.vat_amount = tax_amount
-        invoice.total_amount = job_card.total_amount
-        sync_invoice_payment_status(invoice)
+    # Keep the live intermediate invoice in sync so customers always see the
+    # current state of their estimate. Finals stay locked.
+    intermediate = await session.scalar(
+        select(models.Invoice)
+        .where(
+            models.Invoice.job_card_id == job_card_id,
+            models.Invoice.invoice_type == models.InvoiceType.intermediate,
+            models.Invoice.is_active.is_(True),
+        )
+        .order_by(models.Invoice.id.desc())
+        .limit(1)
+    )
+    if intermediate:
+        intermediate.subtotal = subtotal
+        intermediate.discount_amount = discount
+        intermediate.tax_rate = tax_rate
+        intermediate.vat_amount = tax_amount
+        intermediate.total_amount = total_amount
+
+
+async def upsert_intermediate_invoice(
+    session: AsyncSession,
+    job_card: models.JobCard,
+    notes: str | None,
+) -> models.Invoice:
+    """Idempotent: either updates the existing intermediate or creates one.
+
+    This is the single-source-of-truth invoice for the card — same invoice
+    number across every call, only the totals + notes shift as line items
+    evolve. Refuses with 409 if the job card has already been finalised.
+    Intermediate invoices live-compute their line items via the
+    ``invoice_lines`` dispatcher; no snapshot is written until ``finalize_invoice``.
+    """
+    existing = await latest_active_invoice_for_job(session, job_card.id)
+    if existing and existing.invoice_type == models.InvoiceType.final:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This job card has already been finalised. Open a new job card "
+                "if more work needs to be billed."
+            ),
+        )
+
+    # Refreshes job-card totals *and* the existing intermediate invoice.
+    await recompute_job_card_totals(session, job_card.id)
+
+    if existing:
+        if notes is not None:
+            existing.notes = notes
+        return existing
+
+    net_amount = max(
+        Decimal("0.00"), money(job_card.subtotal) - money(job_card.discount_amount)
+    )
+    tax_amount = money(net_amount * money(job_card.tax_rate) / Decimal("100"))
+    invoice = models.Invoice(
+        invoice_number=await next_number(session, models.Invoice, "INV"),
+        job_card_id=job_card.id,
+        invoice_type=models.InvoiceType.intermediate,
+        subtotal=money(job_card.subtotal),
+        vat_amount=tax_amount,
+        tax_rate=money(job_card.tax_rate),
+        discount_amount=money(job_card.discount_amount),
+        total_amount=money(net_amount + tax_amount),
+        notes=notes,
+        payment_status=models.PaymentStatus.not_paid,
+        amount_paid=Decimal("0.00"),
+        is_active=True,
+    )
+    sync_invoice_payment_status(invoice)
+    session.add(invoice)
+    await session.flush()
+    # No snapshot for intermediate — lines stay live-computed via
+    # ``invoice_lines`` so each share with the customer reflects the
+    # current state of the job card.
+    return invoice
+
+
+async def finalize_invoice(
+    session: AsyncSession,
+    invoice: models.Invoice,
+) -> models.Invoice:
+    """Promote the job card's intermediate invoice to **final**.
+
+    Refreshes totals one last time, snapshots the line items into the
+    ``invoice_lines`` table (so the bill becomes immutable), flips the type,
+    and moves the job card to ``invoiced`` status if it isn't already past
+    that. After this, ``_ensure_job_card_editable`` refuses further line
+    edits on the card — the bill is the bill.
+    """
+    if invoice.invoice_type == models.InvoiceType.final:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Invoice has already been finalised.",
+        )
+
+    job_card = await session.get(models.JobCard, invoice.job_card_id)
+    if not job_card:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job card not found"
+        )
+
+    # One last refresh so any last-minute line edits land before we freeze.
+    await recompute_job_card_totals(session, job_card.id)
+    net_amount = max(
+        Decimal("0.00"), money(job_card.subtotal) - money(job_card.discount_amount)
+    )
+    tax_amount = money(net_amount * money(job_card.tax_rate) / Decimal("100"))
+    invoice.subtotal = money(job_card.subtotal)
+    invoice.discount_amount = money(job_card.discount_amount)
+    invoice.tax_rate = money(job_card.tax_rate)
+    invoice.vat_amount = tax_amount
+    invoice.total_amount = money(net_amount + tax_amount)
+    invoice.invoice_type = models.InvoiceType.final
+
+    # Lock the lines as a snapshot — future card edits won't change the bill.
+    await snapshot_invoice_lines(
+        session,
+        invoice.id,
+        await live_invoice_lines(session, job_card.id, invoice),
+    )
+
+    if job_card.status not in {
+        models.JobCardStatus.complete,
+        models.JobCardStatus.closed,
+        models.JobCardStatus.cancelled,
+    }:
+        job_card.status = models.JobCardStatus.invoiced
+    return invoice
 
 
 @app.patch("/job-cards/{job_card_id}", response_model=schemas.JobCardRead)
@@ -2134,9 +2407,7 @@ async def update_job_card_header(
         setattr(job_card, key, value)
 
     if tax_rate is not None:
-        invoice = await latest_invoice_for_job(session, job_card_id)
-        if invoice:
-            invoice.tax_rate = money(tax_rate)
+        job_card.tax_rate = money(tax_rate)
 
     await recompute_job_card_totals(session, job_card_id)
     await session.commit()
@@ -2351,6 +2622,7 @@ async def create_job_card(
         invoice_notes=payload.invoice_notes,
         subtotal=Decimal("0.00"),
         discount_amount=money(payload.discount_amount),
+        tax_rate=money(payload.tax_rate),
         total_amount=Decimal("0.00"),
         is_active=True,
     )
@@ -2392,29 +2664,59 @@ async def create_job_card(
         subtotal += money(cost.amount)
 
     job_card.subtotal = money(subtotal)
-    net_amount = max(Decimal("0.00"), money(subtotal) - money(payload.discount_amount))
-    tax_rate = money(payload.tax_rate)
-    tax_amount = money(net_amount * tax_rate / Decimal("100"))
-    job_card.total_amount = money(net_amount + tax_amount)
-    if payload.invoice_type == models.InvoiceType.final:
-        job_card.status = models.JobCardStatus.invoiced
-
-    invoice = models.Invoice(
-        invoice_number=await next_number(session, models.Invoice, "INV"),
-        job_card_id=job_card.id,
-        invoice_type=payload.invoice_type,
-        subtotal=job_card.subtotal,
-        vat_amount=tax_amount,
-        tax_rate=tax_rate,
-        discount_amount=job_card.discount_amount,
-        total_amount=job_card.total_amount,
-        notes=payload.invoice_notes,
-        payment_status=models.PaymentStatus.not_paid,
-        amount_paid=Decimal("0.00"),
-        is_active=True,
+    # A new card always starts with an intermediate (estimate) invoice — the
+    # legacy ``payload.invoice_type`` field is ignored. Promote to final via
+    # ``POST /invoices/{id}/finalize`` when the customer is ready to be billed.
+    invoice = await upsert_intermediate_invoice(
+        session,
+        job_card,
+        payload.invoice_notes,
     )
-    sync_invoice_payment_status(invoice)
-    session.add(invoice)
+    await session.commit()
+    await session.refresh(invoice)
+    return invoice
+
+
+@app.post("/job-cards/{job_card_id}/invoices", response_model=schemas.InvoiceRead)
+async def upsert_intermediate_invoice_endpoint(
+    job_card_id: int,
+    payload: schemas.JobCardInvoiceCreate,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    _: Annotated[models.User, Depends(require_admin)],
+):
+    """Create or refresh the **intermediate** invoice for this job card.
+
+    Idempotent — the same invoice number is returned across calls. Use this
+    to keep the customer-facing estimate in step as line items evolve, then
+    call ``POST /invoices/{id}/finalize`` when the bill is ready.
+
+    The ``invoice_type`` field on the payload is ignored — new invoices are
+    always created as intermediate. Type only changes through ``finalize``.
+    """
+    job_card = await _ensure_job_card_editable(session, job_card_id)
+    notes = payload.notes if payload.notes is not None else job_card.invoice_notes
+    invoice = await upsert_intermediate_invoice(session, job_card, notes)
+    await session.commit()
+    await session.refresh(invoice)
+    return invoice
+
+
+@app.post("/invoices/{invoice_id}/finalize", response_model=schemas.InvoiceRead)
+async def finalize_invoice_endpoint(
+    invoice_id: int,
+    session: Annotated[AsyncSession, Depends(get_session)],
+    _: Annotated[models.User, Depends(require_admin)],
+):
+    """Promote a job card's intermediate invoice to **final**.
+
+    Snapshots the line items so the bill becomes immutable, locks the
+    job card against further edits, moves the card to ``invoiced``, and
+    unlocks the payment-recording flow. The same invoice number is kept.
+    """
+    invoice = await session.get(models.Invoice, invoice_id)
+    if not invoice or not invoice.is_active:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    invoice = await finalize_invoice(session, invoice)
     await session.commit()
     await session.refresh(invoice)
     return invoice
@@ -2445,13 +2747,25 @@ async def update_invoice_payment(
     session: Annotated[AsyncSession, Depends(get_session)],
     _: Annotated[models.User, Depends(require_admin)],
 ):
-    """Record an invoice payment. ``payment_status`` is always derived from
-    ``amount_paid`` versus the invoice total so the two cannot drift —
-    previously a client could send ``{amount_paid: 0, payment_status: paid}``
-    and the API would store an inconsistent row."""
+    """Record an invoice payment.
+
+    Intermediate invoices are estimates and can't be paid against — only
+    final invoices are eligible for receivables. ``payment_status`` is
+    always derived from ``amount_paid`` versus the invoice total so the two
+    cannot drift apart.
+    """
     invoice = await session.get(models.Invoice, invoice_id)
     if not invoice:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invoice not found")
+    if invoice.invoice_type != models.InvoiceType.final:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Payments can only be recorded against a final invoice — this "
+                "is an intermediate estimate. Issue the final invoice from the "
+                "job card first, then record payment there."
+            ),
+        )
     amount_paid = money(payload.amount_paid)
     total = money(invoice.total_amount)
     if amount_paid > total:

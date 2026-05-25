@@ -14,6 +14,18 @@ class Settings(BaseSettings):
     # local dev; tighten in production by listing only your real domains.
     cors_allow_origins: str = "*"
 
+    # Swagger UI / OpenAPI exposure. Defaults to **off** so a public deploy
+    # doesn't hand out a free attack-surface map. Flip to ``true`` only on
+    # local dev or behind admin-only auth.
+    expose_api_docs: bool = False
+
+    # One-time setup secret used to bootstrap the first admin from a non-
+    # loopback origin (e.g. through the public Easypanel domain). When set,
+    # any login on an empty users table that supplies a matching
+    # ``X-Bootstrap-Secret`` header is allowed through. Leave blank in normal
+    # operation — once the admin exists the value is ignored anyway.
+    bootstrap_secret: str = ""
+
     smtp_host: str = "smtp.gmail.com"
     smtp_port: int = 587
     smtp_username: str = ""

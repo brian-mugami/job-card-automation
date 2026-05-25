@@ -21,6 +21,35 @@ Initial local-first job card automation system using FastAPI, Streamlit, and Pos
   - `user`: can read setup data only.
 - Base tables for suppliers, users, workers, customers, customer vehicles, work types, garage costs, and garage items.
 
+## Production checklist (read before hosting)
+
+Before deploying to a public domain, set the following in your hosted `.env`:
+
+| Variable | Why it matters |
+|---|---|
+| `APP_SECRET_KEY` | JWT signing key. Generate with `openssl rand -hex 48` — never reuse the default. |
+| `CORS_ALLOW_ORIGINS=https://yourdomain.com` | Tighten away from `*` so only your real frontend can call the API. |
+| `EXPOSE_API_DOCS=false` | Hides Swagger / OpenAPI from public scanners. Default is already `false`. |
+| `BOOTSTRAP_SECRET=<random>` | Optional one-time secret to create the first admin via the public URL. Remove once the admin exists. |
+| `LOCAL_DATABASE_URL` | Use the Postgres credentials from your hosting provider; the default password is for local dev only. |
+| `SMTP_*` | Real Gmail / business SMTP credentials. `SMTP_ENABLED=true`. |
+| `PDF_COMPANY_*` | Your garage's actual branding for the invoice PDFs. |
+
+### Bootstrapping the first admin
+
+The login endpoint refuses to create the first admin from a non-loopback IP by
+default — this stops anyone from claiming an unbootstrapped public instance.
+Two ways to get past it:
+
+1. **Via the server console** — open the API container's terminal in Easypanel
+   (or `docker exec` / SSH on a VPS) and run the Python snippet documented in
+   the hosting guide. No env var needed.
+2. **Via the public URL with a setup secret** — set `BOOTSTRAP_SECRET` to a
+   random string in `.env`, restart the API service, then sign in through the
+   public domain. The Streamlit login form shows a "Setup secret" field when
+   the users table is empty — paste the same value there. After the admin
+   account is created, blank the env var and restart.
+
 ## Local setup
 
 1. Create a PostgreSQL database named `job_card_db`.

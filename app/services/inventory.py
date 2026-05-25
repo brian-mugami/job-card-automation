@@ -55,8 +55,24 @@ async def consume_stock(
             detail="Garage item is inactive and cannot be used on a job card.",
         )
 
-    available = await stock_balance(session, item.garage_item_id)
     quantity = _money(item.quantity)
+
+    receipts = (
+        await session.scalars(
+            select(models.InventoryReceipt)
+            .where(
+                models.InventoryReceipt.garage_item_id == item.garage_item_id,
+                models.InventoryReceipt.remaining_quantity > 0,
+                models.InventoryReceipt.is_active.is_(True),
+            )
+            .order_by(models.InventoryReceipt.id.asc())
+            .with_for_update()
+        )
+    ).all()
+    available = sum(
+        (_money(receipt.remaining_quantity) for receipt in receipts),
+        Decimal("0.00"),
+    )
     if available < quantity:
         name = garage_item.name if garage_item else "Selected item"
         raise HTTPException(
@@ -64,15 +80,6 @@ async def consume_stock(
             detail=f"Not enough stock for {name}. Available: {available}",
         )
 
-    receipts = await session.scalars(
-        select(models.InventoryReceipt)
-        .where(
-            models.InventoryReceipt.garage_item_id == item.garage_item_id,
-            models.InventoryReceipt.remaining_quantity > 0,
-            models.InventoryReceipt.is_active.is_(True),
-        )
-        .order_by(models.InventoryReceipt.id.asc())
-    )
     remaining = quantity
     total_cost = Decimal("0.00")
     for receipt in receipts:
